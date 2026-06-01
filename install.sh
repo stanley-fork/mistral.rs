@@ -62,6 +62,9 @@ detect_os() {
 
 # Minimum required Rust version
 REQUIRED_RUST_VERSION="1.88"
+MISTRALRS_REPO_URL="https://github.com/EricLBuehler/mistral.rs"
+MISTRALRS_BRANCH="master"
+MISTRALRS_CLI_PACKAGE="mistralrs-cli"
 
 # Check if Rust is installed
 check_rust() {
@@ -115,6 +118,17 @@ detect_cuda_compute_cap() {
 
     if [ -n "$cc" ]; then
         echo "$cc"
+    fi
+}
+
+# Detect CUDA toolkit major version from nvcc (e.g. 13). Empty if nvcc is unavailable.
+# CUDA toolkit version as major*100+minor (e.g. 13.1 -> 1301), empty if nvcc absent.
+detect_cuda_version_code() {
+    if command -v nvcc >/dev/null 2>&1; then
+        ver=$(nvcc --version 2>/dev/null | grep -oE "release [0-9]+\.[0-9]+" | head -1 | grep -oE "[0-9]+\.[0-9]+")
+        if [ -n "$ver" ]; then
+            echo $(( ${ver%%.*} * 100 + ${ver#*.} ))
+        fi
     fi
 }
 
@@ -227,6 +241,16 @@ build_features() {
                 features="$features flash-attn"
                 info "Ampere+ GPU detected - enabling flash-attn"
             fi
+            
+            # cuTile: optimized CUDA kernels. Needs CUDA >= 13.1 (its JIT tool tileiras ships with 13.1+);
+            # runs on Ampere (80-89) or Blackwell+ (>=100), not Hopper (90-99).
+            cuda_ver_code=$(detect_cuda_version_code)
+            if [ -n "$cuda_ver_code" ] && [ "$cuda_ver_code" -ge 1301 ] 2>/dev/null; then
+                if { [ "$cuda_cc" -ge 80 ] && [ "$cuda_cc" -lt 90 ]; } || [ "$cuda_cc" -ge 100 ] 2>/dev/null; then
+                    features="$features cutile"
+                    info "CUDA >= 13.1 and supported arch - enabling cutile (optimized kernels)"
+                fi
+            fi
         else
             info "No NVIDIA GPU detected"
         fi
@@ -277,11 +301,11 @@ install_mistralrs() {
     features="$1"
 
     if [ -n "$features" ]; then
-        info "Installing mistralrs-cli with features: $features"
-        cargo install mistralrs-cli@0.8.1 --features "$features"
+        info "Installing mistralrs-cli from GitHub branch $MISTRALRS_BRANCH with features: $features"
+        cargo install --force --git "$MISTRALRS_REPO_URL" --branch "$MISTRALRS_BRANCH" "$MISTRALRS_CLI_PACKAGE" --features "$features"
     else
-        info "Installing mistralrs-cli with default features"
-        cargo install mistralrs-cli@0.8.1
+        info "Installing mistralrs-cli from GitHub branch $MISTRALRS_BRANCH with default features"
+        cargo install --force --git "$MISTRALRS_REPO_URL" --branch "$MISTRALRS_BRANCH" "$MISTRALRS_CLI_PACKAGE"
     fi
 }
 
