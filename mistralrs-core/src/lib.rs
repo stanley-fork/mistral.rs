@@ -9,6 +9,7 @@ pub use engine::{
 };
 use hf_hub::Cache;
 pub use lora::Ordering;
+pub use pipeline::CalibrationStatus;
 pub use pipeline::ModelCategory;
 pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
@@ -59,6 +60,7 @@ pub use toml_selector::{get_toml_selected_model_device_map_params, get_toml_sele
 
 mod amoe;
 mod attention;
+mod block_diffusion;
 mod diagnostics;
 mod diffusion_models;
 pub mod distributed;
@@ -292,9 +294,10 @@ pub use pipeline::{
     UqffWriteConfig, UQFF_MULTI_FILE_DELIMITER,
 };
 pub use request::{
-    ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
-    LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
-    SearchContextSize, TokenizationRequest, WebSearchOptions, WebSearchUserLocation,
+    ApproximateUserLocation, CalibrationAction, CalibrationRequest, Constraint,
+    DetokenizationRequest, ImageGenerationResponseFormat, LlguidanceGrammar, MessageContent,
+    NormalRequest, ReasoningEffort, Request, RequestMessage, SearchContextSize,
+    TokenizationRequest, WebSearchOptions, WebSearchUserLocation,
 };
 pub use response::*;
 pub use sampler::{
