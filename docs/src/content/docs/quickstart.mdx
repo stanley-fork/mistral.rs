@@ -1,0 +1,289 @@
+---
+title: Quickstart
+description: Install the mistralrs CLI, chat with a model in your terminal, and serve an OpenAI-compatible API.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+mistral.rs is a single binary: `mistralrs run` chats with a model in your terminal, `mistralrs serve` exposes the same model over OpenAI-compatible and Anthropic-compatible HTTP APIs. This page covers both, plus in-process inference from Python and Rust.
+
+<Aside type="tip" title="Fast path">
+
+<Tabs>
+<TabItem label="macOS / Linux">
+
+```bash
+# 1. Install: downloads a prebuilt binary for your platform (or builds from source if none matches)
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
+
+# 2. Chat: downloads the weights on first run
+mistralrs run --quant 4 -m Qwen/Qwen3-4B
+
+# 3. Or serve the same model over an OpenAI-compatible API on port 1234
+mistralrs serve --quant 4 -m Qwen/Qwen3-4B
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+# 1. Install from PowerShell (downloads a prebuilt binary, or builds from source)
+irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1 | iex
+
+# 2. Chat: downloads the weights on first run
+mistralrs run --quant 4 -m Qwen/Qwen3-4B
+
+# 3. Or serve the same model over an OpenAI-compatible API on port 1234
+mistralrs serve --quant 4 -m Qwen/Qwen3-4B
+```
+
+</TabItem>
+</Tabs>
+
+Accelerator specifics, manual builds, and the Python/Rust SDKs are below.
+
+</Aside>
+
+## Install
+
+The install script detects your platform and downloads a matching prebuilt binary, falling back to a source build only if none matches your hardware. Prebuilt binaries are self-contained (no CUDA toolkit or Rust needed) and install to `~/.mistralrs`, with `mistralrs` symlinked into `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows).
+
+What you get per platform:
+
+| Platform | Binary | Acceleration |
+|---|---|---|
+| Apple Silicon (macOS) | prebuilt | Metal |
+| Linux x86_64 + NVIDIA GPU | prebuilt, matched to your GPU's compute capability | CUDA, flash-attn, and cuTile where the GPU supports them |
+| Linux x86_64, no GPU | prebuilt | CPU |
+| Windows x86_64 | prebuilt | CPU |
+| anything else (Intel Mac, Linux arm64, an unlisted GPU) | source build | detected at build time |
+
+Prebuilt CUDA binaries are published per compute capability: `sm75, 80, 86, 89, 90, 100, 120, 121`. A GPU outside that set builds from source.
+
+Install-time environment variables:
+
+- `MISTRALRS_INSTALL_TAG=v0.8.4` installs a specific release instead of the latest (downloads that release's prebuilt, or builds that git tag from source).
+- `MISTRALRS_INSTALL_FROM_SOURCE=1` skips the prebuilt download and builds the latest `master` (bleeding edge) from source. The prebuilt path tracks the latest stable release.
+- `MISTRALRS_INSTALL_NO_NCCL=1` (source builds) skips the `nccl` feature.
+
+At runtime, `HF_HOME` controls where models are cached (see [environment variables](/mistral.rs/reference/environment-variables/)).
+
+<Tabs>
+<TabItem label="macOS">
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
+```
+
+Downloads the Metal-accelerated binary on Apple Silicon.
+
+</TabItem>
+<TabItem label="Linux">
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
+```
+
+Downloads a CUDA binary matched to your GPU when one is detected, otherwise the CPU binary. The prebuilt is self-contained; no CUDA toolkit is needed to run it.
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1 | iex
+```
+
+Downloads the CPU binary. For NVIDIA GPU acceleration, run inside WSL2 and follow the Linux instructions, or [build from source](/mistral.rs/developer/from-source/).
+
+</TabItem>
+</Tabs>
+
+Need a source build instead - to track bleeding-edge `master`, pin a commit, or use a feature set the prebuilts omit? See [Build from source](/mistral.rs/developer/from-source/).
+
+A prebuilt install puts `mistralrs` in `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows); if that directory is not on your `PATH`, the installer prints the line to add. A source build instead installs to `~/.cargo/bin/mistralrs`, which is on `PATH` after a new shell or `source "$HOME/.cargo/env"`.
+
+## Verify the install
+
+```bash
+mistralrs --version
+mistralrs doctor
+```
+
+`doctor` reports detected hardware, compiled accelerator features, and Hugging Face cache and connectivity checks:
+
+```
+[INFO] CUDA: nvcc 12.4, driver 12.4
+[INFO] Build features: cuda, cudnn, flash-attn
+```
+
+If your accelerator is missing from build features, rebuild with the right `--features`. For other failures, see [Troubleshooting](/mistral.rs/reference/troubleshooting/).
+
+## Run your first model
+
+```bash
+mistralrs run --quant 4 -m Qwen/Qwen3-4B
+```
+
+The first run downloads the weights from Hugging Face into the local cache, then loads the model onto the detected accelerator. `mistralrs` infers the architecture, chat template, and target device from the repository; every inferred choice can be overridden with a flag.
+
+`--quant 4` prefers a prebuilt [UQFF (Universal Quantized File Format)](/mistral.rs/reference/uqff-format/) quantization from `mistralrs-community` when one is published, otherwise quantizes the weights as they load (in-situ). Omit it to load native precision (BF16 for Qwen3-4B, about 8 GB). See [Quantization](/mistral.rs/guides/quantization/quantize-a-model/) for the decision guide.
+
+The model is ready when an empty prompt appears. Type a message and press Enter; the response streams a token at a time.
+
+```
+> What does Rust's ownership system actually buy you?
+Rust's ownership model gives you memory safety without a garbage collector...
+```
+
+Commands available at the prompt:
+
+- `/help`: list commands
+- `/exit`: quit (Ctrl+D also works)
+- `/system <message>`: add a system message without running the model
+- `/clear`: clear the chat history
+- `/temperature <float>`, `/topk <int>`, `/topp <float>`: adjust sampling
+
+With multimodal models, include image, audio, or video paths or URLs directly in the prompt. For one-shot use, pass `-i "your prompt"` (optionally with `--image`, `--video`, or `--audio`) to send a single request and exit. The full flag set is in the [CLI reference](/mistral.rs/reference/cli/run/).
+
+## Serve an API
+
+```bash
+mistralrs serve --quant 4 -m Qwen/Qwen3-4B
+```
+
+When loading completes:
+
+```
+2026-06-13T12:00:00.000000Z  INFO mistralrs_cli::commands::serve: Server listening on http://0.0.0.0:1234
+```
+
+The server binds `0.0.0.0` by default, reachable from any host on the network; pass `--host 127.0.0.1` to restrict it and `--port` to change the port.
+
+Leave it running and send a Chat Completions request from a second terminal. The same request, on three surfaces:
+
+<Tabs>
+<TabItem label="HTTP">
+
+```bash
+curl http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "messages": [
+      {"role": "user", "content": "In one sentence, what is mistral.rs?"}
+    ]
+  }'
+```
+
+</TabItem>
+<TabItem label="Python">
+
+Any OpenAI client works against `http://localhost:1234/v1`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:1234/v1", api_key="not-used")
+
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Write me a haiku about Rust."}],
+)
+print(response.choices[0].message.content)
+```
+
+The `api_key` field is required by the client but not validated by the server.
+
+</TabItem>
+<TabItem label="Rust">
+
+Send to the running server with any HTTP client (here `reqwest`):
+
+```rust
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let body = json!({
+        "model": "default",
+        "messages": [
+            {"role": "user", "content": "Write me a haiku about Rust."}
+        ]
+    });
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post("http://localhost:1234/v1/chat/completions")
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    println!("{}", resp["choices"][0]["message"]["content"]);
+    Ok(())
+}
+```
+
+To run inference in-process without a server, use the `mistralrs` crate directly (see [Embed in Rust](#embed-in-rust) below).
+
+</TabItem>
+</Tabs>
+
+The model name `default` is special-cased server-side: it always routes to the server's default model, so clients work without knowing the real model id. `GET /v1/models` lists the real id. Full example: [server chat](/mistral.rs/examples/server/chat/).
+
+Three more things the same process gives you:
+
+- A web UI at `http://localhost:1234/ui` (pass `--no-ui` to disable). See [Web UI](/mistral.rs/guides/serve/with-web-ui/).
+- Anthropic-compatible Messages endpoints at base `http://localhost:1234`. See [Anthropic Messages API](/mistral.rs/guides/serve/anthropic-messages-api/).
+- Interactive API docs at `http://localhost:1234/docs`.
+
+The [OpenAI-compatible API guide](/mistral.rs/guides/serve/openai-compatible-apis/) covers streaming, multiple models, and configuration.
+
+## Gated models: log in to Hugging Face
+
+Some models (Gemma, Llama, and others) require accepting a license before download. One-time setup per account, using [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it) as the example:
+
+1. Open the model page on Hugging Face, sign in, and accept the license at the top.
+2. Create a read-only access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+3. Pass the token to mistral.rs:
+
+```bash
+mistralrs login
+```
+
+`login` prompts for the token (or accepts `--token hf_...` non-interactively) and saves it to the Hugging Face token file (`$HF_HOME/token`, default `~/.cache/huggingface/token`). If you have already logged in via `huggingface-cli`, skip this step: both tools read the same file. Then run or serve the gated model as usual:
+
+```bash
+mistralrs serve --quant 4 -m google/gemma-4-E4B-it
+```
+
+## Embed in Rust
+
+Run inference in-process, without a server, using the `mistralrs` crate. Add `mistralrs` and `tokio` to `Cargo.toml` (build with the same accelerator features as the CLI, e.g. `--features metal` or `--features cuda`):
+
+```rust
+use mistralrs::{IsqBits, ModelBuilder, TextMessageRole, TextMessages};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let model = ModelBuilder::new("Qwen/Qwen3-4B")
+        .with_auto_isq(IsqBits::Four)
+        .build()
+        .await?;
+
+    let messages =
+        TextMessages::new().add_message(TextMessageRole::User, "Write me a haiku about Rust.");
+
+    let response = model.send_chat_request(messages).await?;
+    println!("{}", response.choices[0].message.content.as_ref().unwrap());
+    Ok(())
+}
+```
+
+`with_auto_isq(IsqBits::Four)` is the in-process equivalent of `--quant 4`. See the [Rust SDK guide](/mistral.rs/guides/rust/getting-started/) for streaming, multimodal input, and sampling options.
+
+## Next steps
+
+- [Run any model](/mistral.rs/guides/models/run-any-model/): Hugging Face ids, local files, GGUF, and quantization flags.
+- [OpenAI-compatible API](/mistral.rs/guides/serve/openai-compatible-apis/): the canonical serving guide.
+- [Quantization](/mistral.rs/guides/quantization/quantize-a-model/): fit larger models on the same hardware.
+- [Agents & tools](/mistral.rs/guides/agents/): tool calling, web search, code execution, MCP (Model Context Protocol).
+- [Python SDK](/mistral.rs/guides/python/getting-started/) and [Rust SDK](/mistral.rs/guides/rust/getting-started/): in-process inference without a server.
