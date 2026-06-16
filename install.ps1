@@ -16,6 +16,37 @@ function Read-Confirm($prompt) {
     return Read-Host $prompt
 }
 
+function Add-UserPath($PathToAdd) {
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $Entries = @()
+    if ($UserPath) {
+        $Entries = $UserPath -split ';' | Where-Object { $_ }
+    }
+    if ($Entries -notcontains $PathToAdd) {
+        $NewPath = @($PathToAdd) + $Entries
+        [Environment]::SetEnvironmentVariable('Path', ($NewPath -join ';'), 'User')
+    }
+    if (($env:PATH -split ';') -notcontains $PathToAdd) {
+        $env:PATH = "$PathToAdd;$env:PATH"
+    }
+}
+
+function Warn-IfShadowed {
+    param([string]$ExpectedBin, [string]$ExpectedInstall)
+
+    $Command = Get-Command mistralrs -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $Command) { return }
+
+    $Resolved = $Command.Source
+    if (-not $Resolved) { $Resolved = $Command.Path }
+    if (-not $Resolved) { return }
+
+    if (($Resolved -ine $ExpectedBin) -and ($Resolved -ine $ExpectedInstall)) {
+        Write-Warn "Another mistralrs appears earlier on PATH: $Resolved"
+        Write-Host "      The prebuilt install is available at: $ExpectedInstall"
+    }
+}
+
 # Banner
 function Show-Banner {
     Write-Host ""
@@ -347,9 +378,11 @@ function Main {
             Write-Host "  binary   $PrebuiltDir\mistralrs.exe"
             Write-Host "  on PATH  $BinDir\mistralrs.exe (copy)"
             Write-Host ""
-            if ($env:PATH -notmatch [regex]::Escape($BinDir)) {
-                Write-Warn "Add $BinDir to your PATH to run 'mistralrs' from any terminal."
+            if (($env:PATH -split ';') -notcontains $BinDir) {
+                Add-UserPath $BinDir
+                Write-Warn "Added $BinDir to your user PATH. Restart your terminal to use 'mistralrs'."
             }
+            Warn-IfShadowed "$BinDir\mistralrs.exe" "$PrebuiltDir\mistralrs.exe"
             Write-Host ""
             Write-Host "  mistralrs run -m Qwen/Qwen3-4B"
             Write-Host ""
