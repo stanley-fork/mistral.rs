@@ -309,7 +309,7 @@ build_features() {
 
 # Check if ffmpeg is installed
 check_ffmpeg() {
-    command -v ffmpeg >/dev/null 2>&1
+    command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version >/dev/null 2>&1
 }
 
 # Install ffmpeg using the system package manager
@@ -317,8 +317,13 @@ install_ffmpeg() {
     os="$1"
     if [ "$os" = "macos" ]; then
         if command -v brew >/dev/null 2>&1; then
-            info "Installing FFmpeg via Homebrew..."
-            brew install ffmpeg
+            if brew list ffmpeg >/dev/null 2>&1; then
+                info "Reinstalling FFmpeg via Homebrew..."
+                brew reinstall ffmpeg
+            else
+                info "Installing FFmpeg via Homebrew..."
+                brew install ffmpeg
+            fi
         else
             warn "Homebrew not found. Install FFmpeg manually: https://ffmpeg.org/download.html"
             return 1
@@ -363,7 +368,7 @@ install_mistralrs() {
 # aarch64 covers the Grace parts only (GH200/GB200/GB10).
 PREBUILT_CUDA_SMS_X86="80 86 89 90 100 120"
 PREBUILT_CUDA_SMS_AARCH64="90 100 121"
-# MISTRALRS_INSTALL_TAG pins a specific release (e.g. v0.8.5); default is the latest stable release.
+# MISTRALRS_INSTALL_TAG pins a specific release (e.g. v0.8.6); default is the latest stable release.
 if [ -n "$MISTRALRS_INSTALL_TAG" ]; then
     RELEASE_BASE="https://github.com/EricLBuehler/mistral.rs/releases/download/$MISTRALRS_INSTALL_TAG"
 else
@@ -519,7 +524,11 @@ maybe_install_ffmpeg() {
     FFMPEG_SKIPPED=""
     # MISTRALRS_INSTALL_IGNORE_FFMPEG=1 leaves ffmpeg untouched (CI, `mistralrs update`).
     if [ "${MISTRALRS_INSTALL_IGNORE_FFMPEG:-}" = "1" ]; then
-        FFMPEG_SKIPPED=1
+        if check_ffmpeg; then
+            info "FFmpeg is installed (enables video input support)"
+        else
+            FFMPEG_SKIPPED=1
+        fi
         return
     fi
     if check_ffmpeg; then
