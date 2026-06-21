@@ -1,8 +1,7 @@
 use std::{
     env, fs,
-    io::Read,
     ops::Range,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -20,7 +19,6 @@ use hf_hub::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{trace, warn};
 
-use super::FileListCache;
 use crate::utils::tokens::get_token;
 
 /// Env variable that, when set to a truthy value, disables all network calls
@@ -58,8 +56,18 @@ pub(crate) fn offline_missing_file_error(
     revision: &str,
 ) -> anyhow::Error {
     anyhow!(
-        "`{HF_HUB_OFFLINE_ENV}` is set but `{file}` for `{}` (revision `{revision}`) was not found in the local Hugging Face cache. \
-         Unset `{HF_HUB_OFFLINE_ENV}` or pre-download the file (e.g. via `huggingface-cli download`).",
+        "`{HF_HUB_OFFLINE_ENV}` is set, so Hugging Face was not queried. `{file}` for `{}` (revision `{revision}`) was not found in the local Hugging Face cache. \
+         Unset `{HF_HUB_OFFLINE_ENV}` to fetch it online, or pre-download it with `huggingface-cli download {} {file} --revision {revision}`.",
+        model_id.display(),
+        model_id.display()
+    )
+}
+
+fn offline_missing_snapshot_error(model_id: &Path, revision: &str) -> anyhow::Error {
+    anyhow!(
+        "`{HF_HUB_OFFLINE_ENV}` is set, so Hugging Face was not queried. No local Hugging Face snapshot was found for `{}` (revision `{revision}`). \
+         Unset `{HF_HUB_OFFLINE_ENV}` to fetch it online, or pre-download it with `huggingface-cli download {} --revision {revision}`.",
+        model_id.display(),
         model_id.display()
     )
 }
@@ -97,10 +105,59 @@ fn offline_snapshot_files(model_id: &Path, revision: &str) -> Vec<String> {
     files
 }
 
+fn looks_like_local_path(model_id: &Path) -> bool {
+    model_id.is_absolute()
+        || model_id
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        || model_id
+            .to_string_lossy()
+            .starts_with(['~', std::path::MAIN_SEPARATOR])
+}
+
+fn local_resolution_hint(model_id: &Path) -> String {
+    if looks_like_local_path(model_id) {
+        format!(
+            "`{}` looks like a local path, but that path does not exist.",
+            model_id.display()
+        )
+    } else {
+        format!(
+            "No local directory exists at `{}`, so mistral.rs treated it as a Hugging Face model ID.",
+            model_id.display()
+        )
+    }
+}
+
+fn offline_cache_hint(model_id: &Path, revision: &str, file: Option<&str>) -> Option<String> {
+    if is_hf_hub_offline() {
+        return None;
+    }
+
+    if let Some(file) = file {
+        if offline_cache_repo(model_id, revision).get(file).is_some() {
+            return Some(format!(
+                "`{file}` is present in the local Hugging Face cache. If you are offline, set `{HF_HUB_OFFLINE_ENV}=1` to use cached files only."
+            ));
+        }
+        return None;
+    }
+
+    if !offline_snapshot_files(model_id, revision).is_empty() {
+        return Some(format!(
+            "A local Hugging Face snapshot exists for revision `{revision}`. If you are offline, set `{HF_HUB_OFFLINE_ENV}=1` to use cached files only."
+        ));
+    }
+
+    None
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteAccessIssue {
     pub status_code: Option<u16>,
     pub message: String,
+    pub file: Option<String>,
+    pub revision: String,
 }
 
 /// Resolve the Hugging Face home directory.
@@ -153,77 +210,6 @@ pub fn hf_hub_cache_dir() -> Option<PathBuf> {
 /// Resolve the Hugging Face token file path.
 pub fn hf_token_path() -> Option<PathBuf> {
     hf_home_dir().map(|home| home.join("token"))
-}
-
-fn cache_dir() -> PathBuf {
-    hf_hub_cache_dir().unwrap_or_else(|| PathBuf::from("./"))
-}
-
-fn cache_file_for_model(model_id: &Path) -> PathBuf {
-    let sanitized_id = model_id.display().to_string().replace('/', "-");
-    cache_dir().join(format!("{sanitized_id}_repo_list.json"))
-}
-
-fn read_cached_repo_files(cache_file: &Path) -> Option<Vec<String>> {
-    if !cache_file.exists() {
-        return None;
-    }
-
-    let mut file = match fs::File::open(cache_file) {
-        Ok(file) => file,
-        Err(err) => {
-            warn!(
-                "Could not open Hugging Face repo cache file `{}`: {err}",
-                cache_file.display()
-            );
-            return None;
-        }
-    };
-
-    let mut contents = String::new();
-    if let Err(err) = file.read_to_string(&mut contents) {
-        warn!(
-            "Could not read Hugging Face repo cache file `{}`: {err}",
-            cache_file.display()
-        );
-        return None;
-    }
-
-    match serde_json::from_str::<FileListCache>(&contents) {
-        Ok(cache) => {
-            trace!("Read from cache file `{}`", cache_file.display());
-            Some(cache.files)
-        }
-        Err(err) => {
-            warn!(
-                "Could not parse Hugging Face repo cache file `{}`: {err}",
-                cache_file.display()
-            );
-            None
-        }
-    }
-}
-
-fn write_cached_repo_files(cache_file: &Path, files: &[String]) {
-    let cache = FileListCache {
-        files: files.to_vec(),
-    };
-    match serde_json::to_string_pretty(&cache) {
-        Ok(json) => {
-            if let Err(err) = fs::write(cache_file, json) {
-                warn!(
-                    "Could not write Hugging Face repo cache file `{}`: {err}",
-                    cache_file.display()
-                );
-            } else {
-                trace!("Write to cache file `{}`", cache_file.display());
-            }
-        }
-        Err(err) => warn!(
-            "Could not serialize Hugging Face repo cache for `{}`: {err}",
-            cache_file.display()
-        ),
-    }
 }
 
 pub(crate) fn build_api(
@@ -322,7 +308,7 @@ pub async fn try_get_model_file(
     ));
     try_get_file_async(&repo, Path::new(model_id), file, revision)
         .await
-        .map_err(|err| hf_async_api_error(Path::new(model_id), Some(file), &err))
+        .map_err(|err| hf_async_api_error(Path::new(model_id), Some(file), revision, &err))
 }
 
 pub async fn read_model_file_range(
@@ -484,6 +470,7 @@ pub(crate) fn should_propagate_async_api_error(err: &AsyncApiError) -> bool {
 pub(crate) fn remote_issue_from_api_error(
     model_id: &Path,
     file: Option<&str>,
+    revision: &str,
     err: &ApiError,
 ) -> RemoteAccessIssue {
     let target = match file {
@@ -492,90 +479,95 @@ pub(crate) fn remote_issue_from_api_error(
     };
     RemoteAccessIssue {
         status_code: api_error_status_code(err),
-        message: format!("Failed to access {target}: {err}"),
+        message: format!("Failed to access {target} (revision `{revision}`): {err}"),
+        file: file.map(ToString::to_string),
+        revision: revision.to_string(),
     }
 }
 
 pub(crate) fn hf_access_error(model_id: &Path, issue: &RemoteAccessIssue) -> anyhow::Error {
-    match issue.status_code {
-        Some(code @ (401 | 403)) => anyhow!(
-            "Could not access `{}` on Hugging Face (HTTP {code}). You may need to run `mistralrs login` or set HF_TOKEN.",
-            model_id.display()
-        ),
-        Some(404) => anyhow!(
-            "Model `{}` was not found or is not accessible on Hugging Face (HTTP 404). Check the model ID and your access token.",
-            model_id.display()
-        ),
-        Some(code) => anyhow!(
-            "Failed to access `{}` on Hugging Face (HTTP {code}): {}",
-            model_id.display(),
-            issue.message
-        ),
-        None => anyhow!(
-            "Failed to access `{}` on Hugging Face: {}",
-            model_id.display(),
-            issue.message
-        ),
-    }
+    hf_error(
+        model_id,
+        issue.file.as_deref(),
+        &issue.revision,
+        issue.status_code,
+        Some(&issue.message),
+    )
 }
 
-pub(crate) fn hf_api_error(model_id: &Path, file: Option<&str>, err: &ApiError) -> anyhow::Error {
-    let status_code = api_error_status_code(err);
-    let file_context = file
-        .map(|f| format!(" while fetching `{f}`"))
-        .unwrap_or_default();
-    match status_code {
-        Some(code @ (401 | 403)) => anyhow!(
-            "Could not access `{}` on Hugging Face (HTTP {code}){file_context}. You may need to run `mistralrs login` or set HF_TOKEN.",
+fn hf_error(
+    model_id: &Path,
+    file: Option<&str>,
+    revision: &str,
+    status_code: Option<u16>,
+    detail: Option<&str>,
+) -> anyhow::Error {
+    let target = match file {
+        Some(file) => format!(
+            "`{file}` for `{}` (revision `{revision}`)",
             model_id.display()
         ),
-        Some(404) => anyhow!(
-            "Model `{}` was not found or is not accessible on Hugging Face (HTTP 404){file_context}. Check the model ID and your access token.",
-            model_id.display()
+        None => format!("`{}` (revision `{revision}`)", model_id.display()),
+    };
+    let check_hint = if file.is_some() {
+        "Check the model ID, revision, access token, and requested filename."
+    } else {
+        "Check the model ID, revision, and access token."
+    };
+    let mut message = match status_code {
+        Some(code @ (401 | 403)) => format!(
+            "Could not access {target} on Hugging Face (HTTP {code}). Run `mistralrs login` or set `HF_TOKEN` if this is a private or gated repo."
         ),
-        Some(code) => anyhow!(
-            "Failed to access `{}` on Hugging Face (HTTP {code}){file_context}: {err}",
-            model_id.display()
-        ),
-        None => anyhow!(
-            "Failed to access `{}` on Hugging Face{file_context}: {err}",
-            model_id.display()
-        ),
+        Some(404) => format!("Could not find {target} on Hugging Face (HTTP 404). {check_hint}"),
+        Some(code) => format!("Failed to access {target} on Hugging Face (HTTP {code})."),
+        None => format!("Failed to access {target} on Hugging Face."),
+    };
+
+    message.push(' ');
+    message.push_str(&local_resolution_hint(model_id));
+
+    if let Some(hint) = offline_cache_hint(model_id, revision, file) {
+        message.push(' ');
+        message.push_str(&hint);
+    } else if status_code.is_none() {
+        message.push_str(&format!(
+            " If you are offline and have this repo cached, set `{HF_HUB_OFFLINE_ENV}=1`."
+        ));
     }
+
+    if let Some(detail) = detail {
+        message.push_str(" Details: ");
+        message.push_str(detail);
+    }
+
+    anyhow!(message)
+}
+
+pub(crate) fn hf_api_error(
+    model_id: &Path,
+    file: Option<&str>,
+    revision: &str,
+    err: &ApiError,
+) -> anyhow::Error {
+    let status_code = api_error_status_code(err);
+    let detail = err.to_string();
+    hf_error(model_id, file, revision, status_code, Some(&detail))
 }
 
 pub(crate) fn hf_async_api_error(
     model_id: &Path,
     file: Option<&str>,
+    revision: &str,
     err: &AsyncApiError,
 ) -> anyhow::Error {
     let status_code = async_api_error_status_code(err);
-    let file_context = file
-        .map(|f| format!(" while fetching `{f}`"))
-        .unwrap_or_default();
-    match status_code {
-        Some(code @ (401 | 403)) => anyhow!(
-            "Could not access `{}` on Hugging Face (HTTP {code}){file_context}. You may need to run `mistralrs login` or set HF_TOKEN.",
-            model_id.display()
-        ),
-        Some(404) => anyhow!(
-            "Model `{}` was not found or is not accessible on Hugging Face (HTTP 404){file_context}. Check the model ID and your access token.",
-            model_id.display()
-        ),
-        Some(code) => anyhow!(
-            "Failed to access `{}` on Hugging Face (HTTP {code}){file_context}: {err}",
-            model_id.display()
-        ),
-        None => anyhow!(
-            "Failed to access `{}` on Hugging Face{file_context}: {err}",
-            model_id.display()
-        ),
-    }
+    let detail = err.to_string();
+    hf_error(model_id, file, revision, status_code, Some(&detail))
 }
 
 pub(crate) fn local_file_missing_error(model_id: &Path, file: &str) -> anyhow::Error {
     anyhow!(
-        "File `{file}` was not found at local model path `{}`.",
+        "File `{file}` was not found in local model directory `{}`. This model ID was treated as local because that directory exists, so Hugging Face was not queried for this file.",
         model_id.display()
     )
 }
@@ -606,22 +598,13 @@ pub(crate) fn list_repo_files(
         return Ok(files);
     }
 
-    let cache_file = cache_file_for_model(model_id);
-    if let Some(files) = read_cached_repo_files(&cache_file) {
-        return Ok(files);
-    }
-
     if is_hf_hub_offline() {
         let files = offline_snapshot_files(model_id, revision);
         if !files.is_empty() {
-            write_cached_repo_files(&cache_file, &files);
             return Ok(files);
         }
         if should_error {
-            return Err(anyhow!(
-                "`{HF_HUB_OFFLINE_ENV}` is set but no cached file list or snapshot was found for `{}` (revision `{revision}`).",
-                model_id.display()
-            ));
+            return Err(offline_missing_snapshot_error(model_id, revision));
         }
         warn!(
             "`{HF_HUB_OFFLINE_ENV}` is set and no local Hugging Face cache was found for `{}` (revision `{revision}`)",
@@ -637,12 +620,11 @@ pub(crate) fn list_repo_files(
                 .iter()
                 .map(|x| x.rfilename.clone())
                 .collect::<Vec<_>>();
-            write_cached_repo_files(&cache_file, &files);
             Ok(files)
         }
         Err(err) => {
             if should_error || should_propagate_api_error(&err) {
-                Err(hf_api_error(model_id, None, &err))
+                Err(hf_api_error(model_id, None, revision, &err))
             } else {
                 warn!(
                     "Could not get directory listing from Hugging Face for `{}`: {err}",
@@ -680,22 +662,13 @@ pub(crate) async fn list_repo_files_async(
         return Ok(files);
     }
 
-    let cache_file = cache_file_for_model(model_id);
-    if let Some(files) = read_cached_repo_files(&cache_file) {
-        return Ok(files);
-    }
-
     if is_hf_hub_offline() {
         let files = offline_snapshot_files(model_id, revision);
         if !files.is_empty() {
-            write_cached_repo_files(&cache_file, &files);
             return Ok(files);
         }
         if should_error {
-            return Err(anyhow!(
-                "`{HF_HUB_OFFLINE_ENV}` is set but no cached file list or snapshot was found for `{}` (revision `{revision}`).",
-                model_id.display()
-            ));
+            return Err(offline_missing_snapshot_error(model_id, revision));
         }
         warn!(
             "`{HF_HUB_OFFLINE_ENV}` is set and no local Hugging Face cache was found for `{}` (revision `{revision}`)",
@@ -711,12 +684,11 @@ pub(crate) async fn list_repo_files_async(
                 .iter()
                 .map(|x| x.rfilename.clone())
                 .collect::<Vec<_>>();
-            write_cached_repo_files(&cache_file, &files);
             Ok(files)
         }
         Err(err) => {
             if should_error || should_propagate_async_api_error(&err) {
-                Err(hf_async_api_error(model_id, None, &err))
+                Err(hf_async_api_error(model_id, None, revision, &err))
             } else {
                 warn!(
                     "Could not get directory listing from Hugging Face for `{}`: {err}",
@@ -755,7 +727,7 @@ pub(crate) fn get_file(
     }
 
     api.get(file)
-        .map_err(|err| hf_api_error(model_id, Some(file), &err))
+        .map_err(|err| hf_api_error(model_id, Some(file), revision, &err))
 }
 
 /// Like [`get_file`] but returns `Ok(None)` (instead of an error) when the file is genuinely missing, and used with `HF_HUB_OFFLINE`.
