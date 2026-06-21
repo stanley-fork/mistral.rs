@@ -9,7 +9,7 @@
     "license": {
       "name": "MIT"
     },
-    "version": "0.8.18"
+    "version": "0.8.19"
   },
   "paths": {
     "/calibration/apply": {
@@ -4685,6 +4685,21 @@
                 "type": "string",
                 "enum": [
                   "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Structured response as any JSON object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "json_object"
                 ]
               }
             }
