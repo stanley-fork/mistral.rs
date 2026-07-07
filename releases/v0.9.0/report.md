@@ -5,7 +5,7 @@ Cortex-X925) and a c7i.8xlarge Xeon (Sapphire Rapids, AVX512/VNNI/AMX). Values a
 second; speedups are mistral.rs divided by llama.cpp at the same prompt length or decode depth,
 with each engine at its best measured configuration.
 
-![CPU decode speed vs context depth](figures/pro_decode_vs_depth.png)
+![CPU decode speed vs context depth](figures/decode_speedup_vs_depth.png)
 
 Decode is at or ahead of llama.cpp at every measured depth on both architectures, and the lead
 grows with context: 1.81x (x86) and 1.79x (ARM) at 16K depth. The mechanism, in one line: decode
@@ -31,7 +31,7 @@ GB10 (aarch64), mean speedup across context lengths 128-8192/16384:
 | lfm2.5-230m | Q8_0 | 1.07x | 0.96x |
 | lfm2.5-8b-a1b (MoE) | Q4_K | 0.98x | 1.02x |
 
-![Mean speedups](figures/pro_means_q4k.png)
+![Mean speedups](figures/mean_speedup_gb10.png)
 
 x86 (Sapphire Rapids), qwen3-4b, per-point ratios:
 
@@ -131,7 +131,8 @@ All benchmarks are source builds of both engines on the same machine (llama.cpp 
 GGML_NATIVE=ON, mistral.rs with target-cpu=native), which is what the reproducer scripts do.
 Prebuilt installer binaries are portable (runtime-dispatched kernels) and land within ~8% of
 source-built throughput on both architectures; build from source to reproduce the tables
-exactly.
+exactly. Two aarch64 assets ship: the default assumes ARMv8.2 (Graviton2+, Pi 5, 2018+ ARM)
+and a v8.0 compat build covers A72-class boards (Pi 4); the installer picks by cpuinfo probe.
 
 ## Appendix: Full Tables
 
