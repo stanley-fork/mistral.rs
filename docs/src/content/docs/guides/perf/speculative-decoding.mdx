@@ -63,6 +63,7 @@ For full control, `with_mtp_config(MtpConfig { model, n_predict })` is equivalen
 |---|---|---|---|
 | MTP | Gemma 4 | Gemma 4 assistant checkpoints (`--mtp-model`) | Supported with paged attention |
 | MTP | Qwen3.5, Qwen3.8 | Built into the checkpoint (`--mtp`) | Supported with paged attention |
+| DFlash / DFlash 2 | Qwen3.5, Qwen3.8 | DFlash draft checkpoints (`--mtp-model`) | Supported with paged attention |
 
 Legacy target/draft speculative decoding has been removed. New speculative decoding features use the MTP proposer/target path.
 
@@ -75,6 +76,36 @@ mistralrs serve -m Qwen/Qwen3.8-27B --quant 4 --mtp
 ```
 
 The head keeps its own paged KV cache alongside the target's, so the KV budget grows by one attention layer. `--mtp-n-predict` defaults to 2 for these heads. Greedy output is equivalent to non-MTP decoding up to floating-point tie-breaks in the hybrid recurrent layers. UQFF artifacts must include the `mtp.*` tensors to use `--mtp`.
+
+## DFlash and DFlash 2 (Qwen3.5 / Qwen3.8)
+
+[DFlash](https://arxiv.org/abs/2602.06036) drafters are small block-diffusion models that propose a
+whole block of tokens in one pass, conditioned on hidden states tapped from the target's
+intermediate layers. They reach much higher acceptance than the built-in single-token MTP head.
+Pass a DFlash checkpoint (a HF id or local path) as `--mtp-model`; mistral.rs detects DFlash vs
+DFlash 2 from the checkpoint's `architectures` and loads the path selector and dynamic convolutions
+when present:
+
+```bash
+mistralrs serve -m Qwen/Qwen3.8-27B --quant 4 \
+  --mtp-model incoai/Qwen3.8-27B-DFlash2
+```
+
+By default the draft depth is adaptive: it starts at `min(block_size - 1, 7)` and settles per
+workload on a tier from `{3, 5, max}` driven by an EMA of the measured acceptance, so easy content
+(math, code) keeps deep drafts while hard content (thinking-mode reasoning) drops to shallow ones
+instead of paying for rejected verify rows. Adaptation applies at low concurrency (up to 2
+concurrent decodes); larger batches always draft at full depth, where the batched drafter makes
+deep drafts nearly free. Passing `--mtp-n-predict` pins a fixed depth;
+`MISTRALRS_DFLASH_ADAPTIVE=0` disables adaptation, `=1` forces it even with an explicit depth (the
+explicit value becomes the maximum). The drafter's projection weights are requantized to the
+target's in-situ quantization type at load (override with the `MISTRALRS_DFLASH_ISQ` environment
+variable, e.g. `q6k` or `none` for bf16).
+
+Acceptance is strongly content-dependent: [incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+accepts ~7 of 7 drafts on math/code and much less on thinking-mode reasoning traces, which are out
+of its training distribution. As everywhere in this engine, drafts are verified by the target:
+greedy output is byte-identical to non-speculative decoding.
 
 ## Gemma 4
 
