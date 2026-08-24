@@ -172,6 +172,9 @@ use prompt_chunks::{
     build_prompt_chunk_plan, next_prompt_chunk_group, recurrent_checkpoint_boundary,
 };
 
+pub(crate) use self::inputs_processor::{
+    is_inputs_processor_validation_error, InputsProcessorValidationError,
+};
 pub use self::inputs_processor::{
     text_models_inputs_processor, InputsProcessor, InputsProcessorType,
 };
@@ -1302,6 +1305,7 @@ pub struct DecodeGraphPrecaptureCtx {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum CacheBackendMetadata {
     DefaultInstructions {
         pre_op: CacheInstruction,
@@ -2203,17 +2207,17 @@ pub trait Pipeline:
                                     *seq_idx = active_indices[*seq_idx];
                                 }
                             }
-                            let computed_updates = scheduler_visible_prompt_step
-                                .then(|| {
-                                    active_indices
-                                        .iter()
-                                        .map(|&seq_idx| {
-                                            let chunk = chunk_plans[seq_idx][plan_indices[seq_idx]];
-                                            (seq_idx, chunk.end)
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
+                            let computed_updates = if scheduler_visible_prompt_step {
+                                active_indices
+                                    .iter()
+                                    .map(|&seq_idx| {
+                                        let chunk = chunk_plans[seq_idx][plan_indices[seq_idx]];
+                                        (seq_idx, chunk.end)
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
                             inputs.push((
                                 processed,
                                 recurrent_boundaries,
