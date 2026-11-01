@@ -7,7 +7,6 @@ pub use engine::{
     EngineInstruction, IntervalLogger, SearchEmbeddingModel, DEFAULT_MAX_TOOL_ROUNDS,
     ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
 };
-use hf_hub::Cache;
 pub use lora::Ordering;
 pub use pipeline::CalibrationStatus;
 pub use pipeline::ModelCategory;
@@ -175,7 +174,10 @@ pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
 pub use mistralrs_quant::{IsqBits, IsqType};
-pub use mistralrs_sandbox::{NetworkMode, SandboxPolicy};
+pub use mistralrs_sandbox::{
+    NetworkMode, SandboxPolicy, DEFAULT_MAX_CPU_SECS, DEFAULT_MAX_FILE_SZ_MB,
+    DEFAULT_MAX_MEMORY_MB, DEFAULT_MAX_OPEN_FDS, DEFAULT_MAX_PROCS,
+};
 pub use paged_attention::{PagedAttentionConfig, PagedCacheType, PrefixCacheCapacity};
 pub use pipeline::hf::{
     get_model_file, hf_home_dir, hf_hub_cache_dir, hf_token_path, is_hf_hub_offline,
@@ -192,8 +194,8 @@ pub use pipeline::{
     EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
     GemmaLoader, HfConfigOverrides, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader,
-    LlamaLoader, Loader, LocalModelPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
-    ModelPaths, MultimodalLoader, MultimodalLoaderBuilder, MultimodalLoaderType,
+    LlamaLoader, Loader, LocalModelPaths, MistralLoader, MixtralLoader, Modalities, ModelDownload,
+    ModelKind, ModelPaths, MultimodalLoader, MultimodalLoaderBuilder, MultimodalLoaderType,
     MultimodalPromptPrefixer, MultimodalSpecificConfig, NormalLoader, NormalLoaderBuilder,
     NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader,
     ResolvedLoraAdapter, SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality,
@@ -248,11 +250,11 @@ pub use llguidance;
 
 /// `true` if `MISTRALRS_DEBUG=1`
 pub(crate) static DEBUG: AtomicBool = AtomicBool::new(false);
-pub static GLOBAL_HF_CACHE: OnceLock<Cache> = OnceLock::new();
+pub static GLOBAL_HF_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the process-wide Hugging Face cache path before model discovery.
 pub fn set_hf_cache_path(path: impl Into<PathBuf>) {
-    GLOBAL_HF_CACHE.get_or_init(|| Cache::new(path.into()));
+    GLOBAL_HF_CACHE.get_or_init(|| path.into());
 }
 
 pub const DEFAULT_PREFIX_CACHE_N: usize = 16;
@@ -661,6 +663,7 @@ impl MistralRsBuilder {
                         strict: None,
                     },
                 },
+                source: AgentToolSource::User,
             },
         );
         self
@@ -680,6 +683,7 @@ impl MistralRsBuilder {
             ToolCallbackWithTool {
                 callback: ToolCallbackKind::Text(tool_callback),
                 tool,
+                source: AgentToolSource::User,
             },
         );
         self
@@ -2582,6 +2586,33 @@ impl MistralRs {
             Ok(engine_instance.reboot_state.mcp_client_config.is_some())
         } else {
             Err(format!("Model {resolved_model_id} not found"))
+        }
+    }
+
+    /// Check if web search was configured for a model, through a search embedding model or callback
+    pub fn has_search(&self, model_id: Option<&str>) -> Result<bool, String> {
+        let resolved_model_id = self
+            .resolve_alias_or_default(model_id)
+            .map_err(|e| e.to_string())?;
+
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| "Failed to acquire read lock on engines")?;
+        if let Some(engine_instance) = engines.get(&resolved_model_id) {
+            let state = &engine_instance.reboot_state;
+            return Ok(state.search_embedding_model.is_some() || state.search_callback.is_some());
+        }
+        drop(engines);
+
+        let unloaded = self
+            .unloaded_models
+            .read()
+            .map_err(|_| "Failed to acquire read lock on unloaded models")?;
+        match unloaded.get(&resolved_model_id) {
+            Some(state) => Ok(state.engine_config.search_embedding_model.is_some()
+                || state.engine_config.search_callback.is_some()),
+            None => Err(format!("Model {resolved_model_id} not found")),
         }
     }
 
