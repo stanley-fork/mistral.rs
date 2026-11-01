@@ -13,8 +13,9 @@ use super::{
 };
 use super::{
     DiffusionGemmaLoader, Gemma3nLoader, Gemma4Loader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, Lfm2VlLoader, Lfm3AudioLoader, Lfm3OmniLoader, Lfm3VlLoader, Mistral3Loader,
-    MultimodalLoaderType, MuseGlimmerLoader, Phi3VLoader, Qwen2_5VLLoader, VoxtralLoader,
+    LLaVANextLoader, Lfm2VlLoader, Lfm3AudioLoader, Lfm3D1Loader, Lfm3OmniLoader, Lfm3VlLoader,
+    Mistral3Loader, MultimodalLoaderType, MuseGlimmerLoader, Phi3VLoader, Qwen2_5VLLoader,
+    VoxtralLoader,
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
 #[cfg(feature = "cuda")]
@@ -381,6 +382,7 @@ impl MultimodalLoaderBuilder {
             Some(MultimodalLoaderType::Lfm3Vl) => Box::new(Lfm3VlLoader),
             Some(MultimodalLoaderType::Lfm3Audio) => Box::new(Lfm3AudioLoader),
             Some(MultimodalLoaderType::Lfm3Omni) => Box::new(Lfm3OmniLoader),
+            Some(MultimodalLoaderType::Lfm3D1) => Box::new(Lfm3D1Loader),
             Some(MultimodalLoaderType::VLlama) => Box::new(VLlamaLoader),
             Some(MultimodalLoaderType::Qwen2VL) => Box::new(Qwen2VLLoader),
             Some(MultimodalLoaderType::Idefics3) => Box::new(Idefics3Loader),
@@ -570,6 +572,9 @@ impl Loader for MultimodalLoader {
         };
         super::loaders::validate_lora_qk_rope_layout(&config, self.lora_adapters.is_some())?;
         let modalities = self.inner.modalities(&config)?;
+        let is_decision = modalities
+            .output
+            .contains(&crate::SupportedModality::Decision);
         let runtime_config = self
             .inner
             .runtime_config(&config, self.config.max_model_len)?;
@@ -649,7 +654,7 @@ impl Loader for MultimodalLoader {
                 .as_deref()
                 .map(|json| serde_json::from_str(json).unwrap());
             let processor = self.inner.get_processor(
-                &config,
+                &runtime_config,
                 processor_config,
                 preprocessor_config.clone(),
                 self.config.max_edge,
@@ -762,10 +767,16 @@ impl Loader for MultimodalLoader {
 
             // Initial dtype
             let dtype = dtype.try_into_dtype(&available_devices.iter().collect::<Vec<_>>())?;
+            let sizing_source = super::loaders::ResourceSource {
+                weights: self.prepared_source.as_ref().map(|source| &source.weights),
+                paths: paths.get_weight_filenames(),
+            };
+            let checkpoint = sizing_source.checkpoint_tensors()?;
+            let source_quantization = QuantizationConfigShim::get_quantization_config(&config)?;
 
             // ISQ or UQFF: quantized path
             // Match logic below where UQFF has priority
-            let (layer_sizes_in_bytes, non_mapped_size_in_bytes, total_model_size_in_bytes) =
+            let (mut layer_sizes_in_bytes, non_mapped_size_in_bytes, total_model_size_in_bytes) =
                 match super::isq_flow::resolve_auto_device_map_sizing(
                     uqff_reader.is_some(),
                     has_prepared_weight_source,
@@ -784,14 +795,9 @@ impl Loader for MultimodalLoader {
                             None
                         };
                         if let Some(exact) = exact {
-                            let mut layer_sizes = (0..self.inner.num_layers(&config)?)
+                            let layer_sizes = (0..self.inner.num_layers(&config)?)
                                 .map(|layer| exact.layers.get(&layer).copied().unwrap_or(0))
                                 .collect::<Vec<_>>();
-                            for (layer, bytes) in self.inner.unbound_layer_bytes(&config)? {
-                                if let Some(size) = layer_sizes.get_mut(layer) {
-                                    *size += bytes;
-                                }
-                            }
                             let total = layer_sizes.iter().sum::<usize>() + exact.outside;
                             (layer_sizes, exact.outside, total)
                         } else {
@@ -804,6 +810,9 @@ impl Loader for MultimodalLoader {
                                         self.config.topology.as_ref(),
                                     )
                                 };
+                            let quantization = quantization
+                                .with_checkpoint(&checkpoint)
+                                .with_source_quantization(source_quantization.as_ref());
                             let weight_pack_factor = quantization
                                 .conservative_pack_factor(dtype, source.pack_factor(dtype)?);
                             let non_mapped_pack_factor =
@@ -812,12 +821,14 @@ impl Loader for MultimodalLoader {
                                 } else {
                                     1
                                 };
-                            let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
-                                &config,
-                                dtype,
-                                weight_pack_factor,
-                                matformer_slicing_config.as_ref(),
-                            )?;
+                            let layer_sizes_in_bytes =
+                                self.inner.layer_sizes_in_bytes_with_quantization(
+                                    &config,
+                                    dtype,
+                                    weight_pack_factor,
+                                    Some(&quantization),
+                                    matformer_slicing_config.as_ref(),
+                                )?;
                             let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
                                 &config,
                                 dtype,
@@ -877,12 +888,17 @@ impl Loader for MultimodalLoader {
                                 quantization,
                             )
                         };
-                        let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
-                            &config,
-                            dtype,
-                            weight_pack_factor,
-                            matformer_slicing_config.as_ref(),
-                        )?;
+                        let quantization = quantization
+                            .with_checkpoint(&checkpoint)
+                            .with_source_quantization(source_quantization.as_ref());
+                        let layer_sizes_in_bytes =
+                            self.inner.layer_sizes_in_bytes_with_quantization(
+                                &config,
+                                dtype,
+                                weight_pack_factor,
+                                (!moqe).then_some(&quantization),
+                                matformer_slicing_config.as_ref(),
+                            )?;
                         let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
                             &config,
                             dtype,
@@ -929,8 +945,16 @@ impl Loader for MultimodalLoader {
                                 QuantizationConfigShim::get_quant_config_pack_factor(
                                     &config, dtype,
                                 )?;
-                            let quantization = self.config.topology.as_ref().map(|topology| {
-                                AutoDeviceMapQuantization::isq(None, Some(topology))
+                            let checkpoint_quantization =
+                                QuantizationConfigShim::get_quantization_config(&config)?;
+                            let quantization = AutoDeviceMapQuantization::checkpoint(
+                                checkpoint_quantization.as_ref(),
+                                self.config.topology.as_ref(),
+                            )
+                            .map(|quantization| {
+                                quantization
+                                    .with_checkpoint(&checkpoint)
+                                    .with_source_quantization(source_quantization.as_ref())
                             });
                             let weight_pack_factor =
                                 quantization
@@ -939,12 +963,14 @@ impl Loader for MultimodalLoader {
                                         quantization
                                             .conservative_pack_factor(dtype, weight_pack_factor)
                                     });
-                            let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
-                                &config,
-                                dtype,
-                                weight_pack_factor,
-                                matformer_slicing_config.as_ref(),
-                            )?;
+                            let layer_sizes_in_bytes =
+                                self.inner.layer_sizes_in_bytes_with_quantization(
+                                    &config,
+                                    dtype,
+                                    weight_pack_factor,
+                                    quantization.as_ref(),
+                                    matformer_slicing_config.as_ref(),
+                                )?;
                             let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
                                 &config,
                                 dtype,
@@ -962,6 +988,12 @@ impl Loader for MultimodalLoader {
                     }
                 };
 
+            let resources = self.inner.layer_resources(&config, sizing_source)?;
+            let total_model_size_in_bytes = super::loaders::add_resource_bytes(
+                &mut layer_sizes_in_bytes,
+                total_model_size_in_bytes,
+                &resources,
+            )?;
             let new = auto_device_map::get_device_layers(
                 &*self.inner,
                 &config,
@@ -973,6 +1005,7 @@ impl Loader for MultimodalLoader {
                 dtype,
                 &params,
                 paged_attn_config.as_mut(),
+                &resources,
             )?;
             mapper = DeviceMapSetting::Map(new);
         }
@@ -1135,7 +1168,7 @@ impl Loader for MultimodalLoader {
                     ..
                 } => {
                     if let Some(source) = self.prepared_source.as_ref() {
-                        let layers = Arc::new(mistralrs_quant::LoraLayerRegistry::new());
+                        let layers = Arc::new(self.inner.new_lora_registry(&runtime_config)?);
                         let sharded_vb = sharded_vb.with_lora_registry(layers.clone());
                         let tracker = sharded_vb.tracker().clone();
                         let model = self.inner.load(
@@ -1239,7 +1272,7 @@ impl Loader for MultimodalLoader {
                     ..
                 } => {
                     if let Some(source) = self.prepared_source.as_ref() {
-                        let layers = Arc::new(mistralrs_quant::LoraLayerRegistry::new());
+                        let layers = Arc::new(self.inner.new_lora_registry(&runtime_config)?);
                         let vb = source
                             .weights
                             .clone()
@@ -1460,6 +1493,8 @@ impl Loader for MultimodalLoader {
                 module.ct.resolve()?;
             }
         }
+        #[cfg(feature = "cuda")]
+        let mut model = model;
         let model_metadata = crate::paged_attention::with_attention_features(
             model.model_config(),
             self.inner
@@ -1526,41 +1561,86 @@ impl Loader for MultimodalLoader {
             super::prepare_cuda_runtime(&device, pipeline_mapper.as_ref())?;
         }
 
-        let (cache_config, cache_engine) =
-            if let Some(paged_attn_config) = paged_attn_config.as_mut() {
-                let paged_snapshot = paged_attn_config.clone();
-                let capacity_activation_estimate = |usable_tokens| {
-                    super::loaders::estimate_model_activation_memory(
-                        self.inner.as_ref(),
-                        &runtime_config,
-                        super::loaders::ActivationMemoryContext {
-                            params: &activation_params,
-                            limits: paged_snapshot.execution_limits,
-                            dtype,
-                            device: &device,
-                            paged: &paged_snapshot,
-                            cache_capacity_tokens: Some(usable_tokens),
-                        },
-                    )
-                };
-                let memory_reservations =
-                    paged_attention_memory_reservations(model.cache(), paged_attn_config, &device)?;
-                let (cache_config, cache_engine) = allocate_cache(
-                    paged_attn_config,
-                    CacheConfigRequest {
-                        memory_reservations,
+        if let Some(source) = &weight_source {
+            #[cfg(feature = "cuda")]
+            super::synchronize_cuda_contexts(&device, pipeline_mapper.as_ref())?;
+            source.release_source_cache()?;
+        }
+
+        let (cache_config, cache_engine) = if let Some(paged_attn_config) =
+            paged_attn_config.as_mut()
+        {
+            #[cfg(feature = "cuda")]
+            let reserve_decode_graphs = device.is_cuda()
+                && model.supports_cuda_decode_graphs()
+                && cuda_decode_graphs_enabled()
+                && cuda_decode_graph_supported_for_model(Some(model_metadata.as_ref()));
+            #[cfg(not(feature = "cuda"))]
+            let reserve_decode_graphs = false;
+            let paged_snapshot = paged_attn_config.clone();
+            let capacity_activation_estimate = |usable_tokens| {
+                super::loaders::estimate_model_activation_memory(
+                    self.inner.as_ref(),
+                    &runtime_config,
+                    super::loaders::ActivationMemoryContext {
+                        params: &activation_params,
+                        limits: paged_snapshot.execution_limits,
                         dtype,
-                        model: model_metadata.as_ref(),
                         device: &device,
-                        layer_devices: &layer_devices,
-                        capacity_activation_estimate: &capacity_activation_estimate,
-                        silent,
+                        paged: &paged_snapshot,
+                        cache_capacity_tokens: Some(usable_tokens),
                     },
-                )?;
-                (Some(cache_config), Some(cache_engine))
-            } else {
-                (None, None)
+                )
             };
+            let memory_reservations = if paged_attn_config.recurrent_prefix_capacity_auto {
+                paged_attn_config.memory_reservations()?
+            } else {
+                paged_attention_memory_reservations(model.cache(), paged_attn_config, &device)?
+            };
+            let mut cache_request = CacheConfigRequest {
+                memory_reservations,
+                dtype,
+                model: model_metadata.as_ref(),
+                device: &device,
+                layer_devices: &layer_devices,
+                capacity_activation_estimate: &capacity_activation_estimate,
+                reserve_decode_graphs,
+                silent,
+            };
+            #[cfg(feature = "cuda")]
+            {
+                model.prepare_optional_weights(&|device| {
+                    crate::paged_attention::optional_weight_budget(
+                        paged_attn_config,
+                        cache_request,
+                        device,
+                    )
+                    .map_err(candle_core::Error::msg)
+                })?;
+                for (device, bytes) in model.reclaimable_weight_cache_bytes() {
+                    paged_attn_config.reserve_reclaimable_weight_cache(&device, bytes)?;
+                }
+            }
+            super::configure_automatic_recurrent_prefix_capacity(
+                model.cache(),
+                paged_attn_config,
+                cache_request,
+            )?;
+            cache_request.memory_reservations =
+                paged_attention_memory_reservations(model.cache(), paged_attn_config, &device)?;
+            let (cache_config, cache_engine) = allocate_cache(paged_attn_config, cache_request)?;
+            (Some(cache_config), Some(cache_engine))
+        } else {
+            #[cfg(feature = "cuda")]
+            model.prepare_optional_weights(&|device| {
+                let available = crate::MemoryUsage.query(device)?.available();
+                Ok(crate::memory_plan::WeightAllocationBudget {
+                    persistent_bytes: available,
+                    execution_bytes: available,
+                })
+            })?;
+            (None, None)
+        };
 
         let max_seq_len = model.max_seq_len();
         let num_hidden_layers = match model.cache() {
@@ -1581,6 +1661,13 @@ impl Loader for MultimodalLoader {
         }
         let eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
         let sliding_window = model.config().sliding_window;
+        #[cfg(feature = "cuda")]
+        let runtime_memory_reservation = super::paged_attention_runtime_memory_reservation(
+            model.cache(),
+            paged_attn_config.as_ref(),
+            &device,
+            &pipeline_mapper.get_unique_devices(),
+        )?;
         let tracked_modules = tracker.get().clone();
         // rank-sliced layers re-slice at source read; inexpressible slices fall back per layer
         let source_weight_files = match self.prepared_source.as_ref() {
@@ -1601,7 +1688,7 @@ impl Loader for MultimodalLoader {
                 num_hidden_layers,
                 eos_tok: eos,
                 kind: self.kind.clone(),
-                no_kv_cache: false,
+                no_kv_cache: is_decision,
                 no_prefix_cache: !self.inner.supports_prefix_cacher(&config),
                 activation_dtype: dtype,
                 sliding_window,
@@ -1611,10 +1698,7 @@ impl Loader for MultimodalLoader {
                     .as_ref()
                     .map(|config| config.runtime_memory_plan()),
                 #[cfg(feature = "cuda")]
-                runtime_memory_reservation: paged_attn_config.as_ref().and_then(|config| {
-                    config
-                        .runtime_memory_reservation(&device, &pipeline_mapper.get_unique_devices())
-                }),
+                runtime_memory_reservation,
                 model_metadata: Some(model_metadata),
                 modalities,
                 loaded_for_uqff_write: self.config.write_uqff.is_some(),
@@ -1716,6 +1800,9 @@ impl IsqPipelineMixin for MultimodalPipeline {
 
 impl CacheManagerMixin for MultimodalPipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        if self.metadata.no_kv_cache {
+            return Ok(());
+        }
         match self.model.cache() {
             EitherCache::Full(_) => FullCacheManager.clone_in_cache(self, seqs, false),
             EitherCache::Normal(_) => NormalCacheManager.clone_in_cache(self, seqs, false),
@@ -1723,6 +1810,9 @@ impl CacheManagerMixin for MultimodalPipeline {
         }
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
+        if self.metadata.no_kv_cache {
+            return;
+        }
         match self.model.cache() {
             EitherCache::Full(_) => FullCacheManager.clone_out_cache(self, seqs, false),
             EitherCache::Normal(_) => NormalCacheManager.clone_out_cache(self, seqs, false),
@@ -1737,23 +1827,25 @@ impl CacheManagerMixin for MultimodalPipeline {
 
         load_preallocated_cache: bool,
     ) -> candle_core::Result<()> {
-        match self.model.cache() {
-            EitherCache::Full(_) => {
-                FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)
-            }
-            EitherCache::Normal(_) => NormalCacheManager.set_none_cache(
-                self,
-                seqs,
-                modify_draft_cache,
-                load_preallocated_cache,
-            ),
-            EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(
-                self,
-                seqs,
-                modify_draft_cache,
-                load_preallocated_cache,
-            ),
-        }?;
+        if !self.metadata.no_kv_cache {
+            match self.model.cache() {
+                EitherCache::Full(_) => {
+                    FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)
+                }
+                EitherCache::Normal(_) => NormalCacheManager.set_none_cache(
+                    self,
+                    seqs,
+                    modify_draft_cache,
+                    load_preallocated_cache,
+                ),
+                EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(
+                    self,
+                    seqs,
+                    modify_draft_cache,
+                    load_preallocated_cache,
+                ),
+            }?;
+        }
         let sequence_ids = seqs.iter().map(|seq| *seq.id()).collect::<Vec<_>>();
         self.model
             .reset_model_specific_state_for_sequences(&sequence_ids);
@@ -2817,6 +2909,26 @@ impl Pipeline for MultimodalPipeline {
         Ok(self.forward_step(inputs, return_raw_logits)?.output)
     }
 
+    fn forward_decision(
+        &self,
+        sequence: &mut Sequence,
+    ) -> Result<crate::decision::DecisionResponse> {
+        let tokenizer = self
+            .tokenizer()
+            .context("Decision models require a tokenizer")?;
+        let processor = self.get_processor();
+        self.model.forward_decision(
+            sequence,
+            super::DecisionForwardContext {
+                tokenizer: &tokenizer,
+                processor: processor.as_ref(),
+                device: &self.device(),
+                processor_config: self.get_input_processor_config(),
+                mapper: self.device_mapper(),
+            },
+        )
+    }
+
     fn forward_step(
         &mut self,
         inputs: Box<dyn Any>,
@@ -3257,7 +3369,16 @@ impl Pipeline for MultimodalPipeline {
         .await
     }
     fn category(&self) -> ModelCategory {
-        if matches!(
+        if self
+            .metadata
+            .modalities
+            .output
+            .contains(&crate::SupportedModality::Decision)
+        {
+            ModelCategory::Decision {
+                video_sampling: self.video_sampling,
+            }
+        } else if matches!(
             self.metadata.modalities.input.as_slice(),
             [crate::SupportedModality::Text]
         ) {

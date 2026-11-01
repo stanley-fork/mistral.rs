@@ -247,6 +247,68 @@ class CompletionRequest:
     ignore_eos: bool = False
     adapter: str | LoraAdapterGeneration | None = field(default=None, kw_only=True)
 
+class DecisionQuestion:
+    """A typed decision question; spoken instructions accept audio_url/input_audio content parts."""
+    def __init__(
+        self,
+        kind: Literal["noul", "choice", "score", "text", "number", "date", "box", "boxes"],
+        instructions: str | dict[str, Any],
+        *,
+        criteria: dict[str, Any] | list[str] | None = None,
+        multiple: bool = False,
+        range: tuple[float, float] | None = None,
+        step: float | None = None,
+        unit: str | None = None,
+        max: int | None = None,
+    ) -> None: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
+class DecisionRequest:
+    """State is any JSON value. Media accepts image_url, audio_url, input_audio, and video_url parts."""
+    def __init__(
+        self,
+        state: Any,
+        questions: dict[str, DecisionQuestion | dict[str, Any]],
+        *,
+        images: list[str] | None = None,
+        media: list[dict[str, Any]] | None = None,
+        set_size: int | None = None,
+    ) -> None: ...
+
+class DecisionAnswer:
+    """Fields depend on type; absent optional fields return None. to_dict preserves the wire object."""
+    type: Literal["noul", "choice", "score", "text", "number", "date", "box", "boxes"]
+    noul: float
+    choice: str | None
+    choices: list[str] | None
+    confidence: float | None
+    probabilities: dict[str, float]
+    score: float
+    legend: dict[str, str]
+    text: str | None
+    span: list[int] | None
+    found: float | None
+    path: str | None
+    number: float | None
+    unit: str | None
+    interval: list[float] | None
+    date: str | None
+    box: dict[str, float] | None
+    boxes: list[dict[str, Any]]
+    count: int
+    at_least: bool
+    presence: list[float]
+    def to_dict(self) -> dict[str, Any]: ...
+
+class DecisionUsage:
+    input_tokens: int
+    output_tokens: int
+
+class DecisionResponse:
+    answers: dict[str, DecisionAnswer]
+    usage: DecisionUsage
+    def to_dict(self) -> dict[str, Any]: ...
+
 @dataclass
 class EmbeddingRequest:
     """
@@ -299,6 +361,7 @@ class MultimodalArchitecture(Enum):
     Lfm3Vl = "lfm3vl"
     Lfm3Audio = "lfm3audio"
     Lfm3Omni = "lfm3omni"
+    Lfm3D1 = "lfm3d1"
     VLlama = "vllama"
     Qwen2VL = "qwen2vl"
     Idefics3 = "idefics3"
@@ -717,7 +780,7 @@ class Runner:
         which: Which,
         max_seqs: int = 32,
         no_kv_cache: bool = False,
-        prefix_cache_n: int = 16,
+        prefix_cache_n: int | None = None,
         token_source: str = "cache",
         mtp_model: str | None = None,
         mtp_n_predict: int | None = None,
@@ -746,7 +809,7 @@ class Runner:
         - `which` specifies which model to load.
         - `max_seqs` specifies how many sequences may be running at any time.
         - `no_kv_cache` disables the KV cache.
-        - `prefix_cache_n` sets the number of sequences to hold in the device prefix cache; older ones are evicted (dropped) and re-prefilled on a later match.
+        - `prefix_cache_n` sets the number of sequences to retain in the prefix cache. The default `None` allows up to 16, reduced when recurrent state must share memory with model weights; explicit integers preserve the requested capacity, and `0` disables retention.
         - `token_source` specifies where to load the HF token from.
             The token source follows the following format: "literal:<value>", "env:<value>", "path:<value>", "cache" to use a cached token or "none" to use no token.
         - `mtp_model` attaches an MTP assistant from a model id or path.
@@ -799,6 +862,11 @@ class Runner:
             request: The completion request.
             model_id: Optional model ID to send the request to. If None, uses the default model.
         """
+
+    def send_decision_request(
+        self, request: DecisionRequest, model_id: str | None = None
+    ) -> DecisionResponse:
+        """Evaluate named decision questions with the selected model, without text generation."""
 
     def send_embedding_request(
         self, request: EmbeddingRequest, model_id: str | None = None
